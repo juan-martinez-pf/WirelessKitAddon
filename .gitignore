@@ -3,3 +3,6 @@ obj
 build
 temp
 .DS_Store
+
+#local deplayment tool for macOS
+deploy.sh
