@@ -95,14 +95,13 @@ namespace WirelessKitAddon
                 HandleWirelessKit((_driver as Driver)!);
             }
 
-            // If we still couldn't open the standard 32-byte battery endpoint (e.g. on macOS
-            // where the dongle only exposes 0-byte, 10-byte, and 64-byte interfaces),
-            // set up the daemon and tray icon anyway. Battery level will show as "unknown"
-            // since macOS does not expose the wireless status HID interface.
+            // If we still couldn't open the 32-byte battery endpoint, check if the dongle
+            // is present at all — if so, run in passthrough mode (no battery data).
             if (_reader == null && DeviceList.Local.GetHidDevices()
                 .Any(d => d.VendorID == WACOM_VID && d.ProductID == WIRELESS_KIT_PID))
             {
                 _isWireless = true;
+
                 Log.Write("Wireless Kit Addon",
                     "Using wireless passthrough mode — battery status is unavailable on this platform.",
                     LogLevel.Info);
@@ -116,8 +115,8 @@ namespace WirelessKitAddon
 
                 if (_daemon != null && _instance != null)
                 {
-                    // In passthrough mode, battery data is not available — set to -1
-                    // which triggers the "battery_unknown" icon in the tray UI.
+                    // In passthrough mode (no reader at all), battery data is not available
+                    // — set to -1 which triggers the "battery_unknown" icon in the tray UI.
                     if (_isWireless && _reader == null)
                         _instance.BatteryLevel = -1;
 
@@ -141,12 +140,6 @@ namespace WirelessKitAddon
                 HandleMatch(matches);
             }
 
-            // On macOS, the 32-byte endpoint does not exist. The dongle only exposes:
-            //   - InputLen=0  (control, FeatureLen=259)
-            //   - InputLen=10 (pen data, shared with OTD's main reader)
-            //   - InputLen=64 (aux/express keys)
-            // None of these carry battery status reports (0xC0/0x80).
-            // Battery reading is not possible — we fall through to passthrough mode.
         }
 
         protected override void HandleWiredTablet(Driver driver)
@@ -315,7 +308,7 @@ namespace WirelessKitAddon
                 _instance = null;
             }
 
-            // Dispose of the reader, 
+            // Dispose of the reader,
             // No need to dispose of the output mode as it's not owned by us
             if (_reader != null)
             {

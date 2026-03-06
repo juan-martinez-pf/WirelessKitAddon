@@ -10,6 +10,7 @@ using OpenTabletDriver.Plugin.Devices;
 using System.Collections.Immutable;
 using WirelessKitAddon.Lib;
 using WirelessKitAddon.Interfaces;
+using WirelessKitAddon.Devices;
 
 #if OTD06
 
@@ -62,6 +63,7 @@ namespace WirelessKitAddon
         private TabletReference? _tablet;
 
         private InputDevice? _device;
+        private bool _subscribedToHub;
 
         #endregion
 
@@ -89,34 +91,63 @@ namespace WirelessKitAddon
                 // Try wired first: if the tablet's wired USB device is present, use it
                 HandleWiredTablet(_driver);
 
-                // If wired device wasn't found, the tablet must be communicating over the wireless dongle
+                // If wired device wasn't found, try wireless discovery
                 if (DeviceTree == null)
                 {
-                    HandleWirelessKit(_driver);
-                }
+                    bool donglePresent = _driver.CompositeDeviceHub.GetDevices()
+                        .Any(d => d.VendorID == WACOM_VID && d.ProductID == WIRELESS_KIT_PID);
 
-                // If we still couldn't open the standard 32-byte battery endpoint (e.g. on macOS
-                // where the dongle only exposes 0-byte, 10-byte, and 64-byte interfaces),
-                // enter passthrough mode. Battery level will show as "unknown"
-                // since macOS does not expose the wireless status HID interface.
-                if (DeviceTree == null && _driver.CompositeDeviceHub.GetDevices()
-                    .Any(d => d.VendorID == WACOM_VID && d.ProductID == WIRELESS_KIT_PID))
-                {
-                    _isWireless = true;
-                    Log.Write("Wireless Kit Addon",
-                        "Dongle detected — checking for tablet presence...", LogLevel.Info);
-
-                    if (IsTabletBehindDongle())
+                    if (OperatingSystem.IsMacOS() && donglePresent)
                     {
-                        // Tablet is connected right now — proceed with full setup
-                        OnTabletDetected();
+                        // macOS: the WirelessDongleHub reads the 32-byte wireless report
+                        // and presents a proxy endpoint with the tablet's real PID.
+                        // We subscribe to its events for battery/connection data.
+                        _isWireless = true;
+
+                        var hub = WirelessDongleHub.Instance;
+                        if (hub != null)
+                        {
+                            hub.Report += OnHubReport;
+                            hub.ReadingChanged += OnConnectionStateChanged;
+                            _subscribedToHub = true;
+
+                            // Don't call OnTabletDetected() yet — the dongle sends reports
+                            // even when the tablet is powered off (with IsConnected = false).
+                            // OnHubReport will call OnTabletDetected() when the first report
+                            // with IsConnected = true arrives.
+                            Log.Write("Wireless Kit Addon",
+                                "Subscribed to dongle hub — waiting for tablet connection...", LogLevel.Info);
+                        }
+                        else
+                        {
+                            // Hub should always exist at this point (daemon creates it before
+                            // firing Ready). If it doesn't, the hub will trigger re-detection
+                            // via DevicesChanged when it creates the proxy endpoint.
+                            Log.Write("Wireless Kit Addon",
+                                "Dongle hub not available — hub will trigger detection when ready.", LogLevel.Warning);
+                        }
                     }
                     else
                     {
-                        // Dongle present but no tablet powered on — poll in background
-                        Log.Write("Wireless Kit Addon",
-                            "Dongle present but no tablet connected. Monitoring...", LogLevel.Info);
-                        StartPresenceMonitor();
+                        // Windows/Linux: use standard HidSharp 32-byte endpoint
+                        HandleWirelessKit(_driver);
+
+                        if (DeviceTree == null && donglePresent)
+                        {
+                            _isWireless = true;
+
+                            Log.Write("Wireless Kit Addon",
+                                "Dongle detected — checking for tablet presence...", LogLevel.Info);
+
+                            if (IsTabletBehindDongle())
+                                OnTabletDetected();
+                            else
+                            {
+                                Log.Write("Wireless Kit Addon",
+                                    "Dongle present but no tablet connected. Monitoring...", LogLevel.Info);
+                                StartPresenceMonitor();
+                            }
+                        }
                     }
                 }
 
@@ -158,12 +189,6 @@ namespace WirelessKitAddon
                 HandleMatch(driver, matches);
             }
 
-            // On macOS, the 32-byte endpoint does not exist. The dongle only exposes:
-            //   - InputLen=0  (control, FeatureLen=259)
-            //   - InputLen=10 (pen data, shared with OTD's main reader)
-            //   - InputLen=64 (aux/express keys)
-            // None of these carry battery status reports (0xC0/0x80).
-            // Battery reading is not possible — we fall through to passthrough mode.
         }
 
         protected override void HandleWiredTablet(Driver driver)
@@ -178,7 +203,10 @@ namespace WirelessKitAddon
                 return;
 
             // Verify the wired device actually exists on the USB bus
-            var matches = GetMatchingDevices(driver, Tablet!.Properties, device.Identifier).ToList();
+            // Exclude proxy endpoints — they look like wired devices but are wireless dongle proxies
+            var matches = GetMatchingDevices(driver, Tablet!.Properties, device.Identifier)
+                .Where(d => !d.DevicePath.StartsWith("wireless-proxy://"))
+                .ToList();
 
             if (matches.Count == 0)
                 return;
@@ -406,10 +434,14 @@ namespace WirelessKitAddon
 
             if (_daemon != null && _instance != null)
             {
-                _instance.BatteryLevel = -1;
+                // Only set battery to unknown if no reader is active
+                if (!_subscribedToHub)
+                    _instance.BatteryLevel = -1;
+
                 _ = Task.Run(SetupTrayIcon);
 
                 var name = _instance.Name;
+                var mode = "wireless dongle";
                 Log.Write("Wireless Kit Addon", $"Now handling Wireless Kit Reports for {name}", LogLevel.Info);
 
                 var delay = Math.Max(NotificationTimeout, 1) * 1000;
@@ -417,9 +449,37 @@ namespace WirelessKitAddon
                 {
                     await Task.Delay(delay);
                     Log.WriteNotify("Wireless Kit Addon",
-                        $"{name} connected through wireless dongle.", LogLevel.Info);
+                        $"{name} connected through {mode}.", LogLevel.Info);
                 });
             }
+        }
+
+        /// <summary>
+        ///   Called when the tablet is powered off while the hub is active.
+        ///   Tears down the daemon instance, tray icon, and shows a disconnect notification,
+        ///   but keeps the hub subscription alive so it can detect the tablet powering back on.
+        /// </summary>
+        private void OnTabletPoweredOff()
+        {
+            var name = _instance?.Name ?? "Tablet";
+
+            if (_instance != null && _daemon != null)
+            {
+                _daemon.Remove(_instance);
+                Log.Write("Wireless Kit Addon",
+                    $"Stopped handling Wireless Kit Reports for {name}", LogLevel.Info);
+                _instance = null;
+            }
+
+            _trayManager?.Dispose();
+            _trayManager = null;
+
+            // Reset battery warnings so they fire again on reconnect
+            _pastEarlyWarning = false;
+            _pastLateWarning = false;
+
+            Log.WriteNotify("Wireless Kit Addon",
+                $"{name} disconnected.", LogLevel.Info);
         }
 
         #endregion
@@ -438,6 +498,32 @@ namespace WirelessKitAddon
         {
             if (connected == false) // Pre-Dispose on disconnect
                 StopHandling();
+        }
+
+        /// <summary>
+        ///   Handles reports from the wireless dongle hub.
+        ///   Detects tablet power-on/off transitions via IsConnected and starts or
+        ///   tears down the daemon, tray icon, and notification accordingly.
+        ///   The hub subscription stays alive across power cycles so it can
+        ///   detect the tablet powering back on.
+        /// </summary>
+        private void OnHubReport(object? sender, IDeviceReport report)
+        {
+            if (report is IWirelessKitReport wirelessReport)
+            {
+                if (wirelessReport.IsConnected && _instance == null)
+                {
+                    // Tablet powered on (or first connected report)
+                    OnTabletDetected();
+                }
+                else if (!wirelessReport.IsConnected && _instance != null)
+                {
+                    // Tablet powered off — tear down services but keep hub subscription alive
+                    OnTabletPoweredOff();
+                }
+            }
+
+            Consume(report);
         }
 
         #endregion
@@ -481,6 +567,17 @@ namespace WirelessKitAddon
 
                 DeviceTree = null;
             }
+
+            if (_subscribedToHub)
+            {
+                var hub = WirelessDongleHub.Instance;
+                if (hub != null)
+                {
+                    hub.Report -= OnHubReport;
+                    hub.ReadingChanged -= OnConnectionStateChanged;
+                }
+                _subscribedToHub = false;
+            }
         }
 
         public override void Dispose()
@@ -489,22 +586,16 @@ namespace WirelessKitAddon
             _presenceCts?.Dispose();
             _presenceCts = null;
 
-            if (_instance != null && _daemon != null)
-                StopHandling();
-
-            if (DeviceTree != null)
-            {
-                foreach (var device in DeviceTree.InputDevices)
-                    device.Dispose();
-
-                DeviceTree = null;
-            }
+            // StopHandling() already handles daemon removal, DeviceTree disposal,
+            // and hub cleanup with proper null guards.
+            StopHandling();
 
             WirelessKitDaemonBase.Ready -= OnDaemonReady;
             _instance = null;
             _daemon = null;
 
             _trayManager?.Dispose();
+            _trayManager = null;
 
             GC.SuppressFinalize(this);
         }
