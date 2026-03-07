@@ -1,3 +1,4 @@
+using System;
 using HidSharp;
 using OpenTabletDriver;
 using OpenTabletDriver.Plugin;
