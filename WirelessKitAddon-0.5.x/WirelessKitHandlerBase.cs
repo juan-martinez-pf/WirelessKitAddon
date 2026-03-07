@@ -74,7 +74,8 @@ namespace WirelessKitAddon.Lib
 
         public async Task SetupTrayIcon()
         {
-            if (_instance == null)
+            var instance = _instance;
+            if (instance == null)
                 return;
 
             _trayManager = new TrayManager();
@@ -85,7 +86,7 @@ namespace WirelessKitAddon.Lib
                 return;
             }
 
-            _trayManager.Start(_instance.Name);
+            _trayManager.Start(instance.Name);
         }
 
         #endregion
