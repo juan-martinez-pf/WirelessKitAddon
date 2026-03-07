@@ -168,7 +168,10 @@ public partial class WirelessKitViewModel : ViewModelBase, IDisposable
         if (CurrentInstance != null)
         {
             _beforeActive = TimeSpan.FromSeconds(CurrentInstance.TimeBeforeNotification);
-            _displayedBatteryLevel = CurrentInstance.BatteryLevel;
+            // Only seed the display filter when the daemon already has a real reading;
+            // a 0 from the initial instance would lock the ratchet-down filter at 0.
+            if (CurrentInstance.BatteryLevel > 0)
+                _displayedBatteryLevel = CurrentInstance.BatteryLevel;
             var instance = CurrentInstance;
             Dispatcher.UIThread.Post(() =>
             {
