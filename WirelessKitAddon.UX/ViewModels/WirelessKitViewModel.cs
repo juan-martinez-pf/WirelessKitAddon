@@ -79,14 +79,19 @@ public partial class WirelessKitViewModel : ViewModelBase, IDisposable
         _daemonClient = new RpcClient<IWirelessKitDaemon>("WirelessKitDaemon");
 
         var icons = LoadBitmaps(
-            "Assets/battery_unknown.ico",
-            "Assets/battery_0.ico",
-            "Assets/battery_10.ico",
-            "Assets/battery_33.ico",
-            "Assets/battery_50.ico",
-            "Assets/battery_75.ico",
-            "Assets/battery_100.ico",
-            "Assets/battery_charging.ico"
+            "Assets/battery_unknown.ico",       // 0
+            "Assets/battery_0.ico",             // 1
+            "Assets/battery_10.ico",            // 2
+            "Assets/battery_33.ico",            // 3
+            "Assets/battery_50.ico",            // 4
+            "Assets/battery_75.ico",            // 5
+            "Assets/battery_100.ico",           // 6
+            "Assets/battery_0_charging.ico",    // 7
+            "Assets/battery_10_charging.ico",   // 8
+            "Assets/battery_33_charging.ico",   // 9
+            "Assets/battery_50_charging.ico",   // 10
+            "Assets/battery_75_charging.ico",   // 11
+            "Assets/battery_100_charging.ico"   // 12
         );
 
         foreach (var icon in icons)
@@ -172,6 +177,7 @@ public partial class WirelessKitViewModel : ViewModelBase, IDisposable
             // a 0 from the initial instance would lock the ratchet-down filter at 0.
             if (CurrentInstance.BatteryLevel > 0)
                 _displayedBatteryLevel = CurrentInstance.BatteryLevel;
+
             var instance = CurrentInstance;
             Dispatcher.UIThread.Post(() =>
             {
@@ -238,28 +244,33 @@ public partial class WirelessKitViewModel : ViewModelBase, IDisposable
 
     public WindowIcon GetBatteryIcon(float batteryLevel, bool isCharging)
     {
-        if (isCharging)
-            return _icons[7];
+        // Ranges use midpoints between icon labels so each icon represents the closest match.
+        // Charging icons are at offset +6 from their non-charging counterparts.
+        int offset = isCharging ? 6 : 0;
 
-        // Ranges use midpoints between icon labels so each icon represents the closest match:
-        // battery_0 (0%), battery_10 (1-20%), battery_33 (21-40%), battery_50 (41-62%),
-        // battery_75 (63-87%), battery_100 (88-100%)
         return batteryLevel switch
         {
-            0 => _icons[1],
-            > 0 and <= 20 => _icons[2],
-            > 20 and <= 40 => _icons[3],
-            > 40 and <= 62 => _icons[4],
-            > 62 and <= 87 => _icons[5],
-            > 87 => _icons[6],
+            0 => _icons[1 + offset],
+            > 0 and <= 20 => _icons[2 + offset],
+            > 20 and <= 40 => _icons[3 + offset],
+            > 40 and <= 62 => _icons[4 + offset],
+            > 62 and <= 87 => _icons[5 + offset],
+            > 87 => _icons[6 + offset],
             _ => _icons[0]
         };
     }
 
     private void UpdateTrayIcon(WindowIcon icon, string toolTip)
     {
-        CurrentIcon = icon;
-        CurrentToolTip = toolTip;
+        // Avalonia's TrayIcon XAML binding for Icon doesn't propagate changes
+        // to the native NSStatusItem on macOS. Set the property directly
+        // on the TrayIcon object to bypass the broken binding path.
+        var trayIcons = TrayIcon.GetIcons(Application.Current!);
+        if (trayIcons?.Count > 0)
+            trayIcons[0].Icon = icon;
+
+        CurrentIcon = icon;      // keep binding in sync for non-macOS
+        CurrentToolTip = toolTip; // tooltip binding works fine
     }
 
     [RelayCommand]
@@ -327,7 +338,7 @@ public partial class WirelessKitViewModel : ViewModelBase, IDisposable
     private void OnInstanceChanged(object? sender, WirelessKitInstance instance)
     {
         if (instance != null && instance.Name == CurrentInstance?.Name)
-        {   
+        {
             var rawLevel = (float)Math.Round(instance.BatteryLevel, 2);
             CurrentInstance.IsCharging = instance.IsCharging;
 
