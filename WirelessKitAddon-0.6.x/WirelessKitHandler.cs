@@ -152,7 +152,23 @@ namespace WirelessKitAddon
                 }
 
                 if (DeviceTree == null && !_isWireless)
-                    Log.Write("Wireless Kit Addon", $"Failed to handle the Wireless Kit for {tablet.Properties.Name}", LogLevel.Warning);
+                {
+                    // No separate battery device found and no wireless dongle.
+                    // The wired battery report (0xC0) may still arrive through the pipeline
+                    // on the same HID interface as pen data. Create _instance so Consume()
+                    // can intercept raw 0xC0 reports.
+                    BringToDaemon();
+                    if (_daemon != null && _instance != null)
+                    {
+                        _ = Task.Run(SetupTrayIcon);
+                        Log.Write("Wireless Kit Addon",
+                            $"Monitoring pipeline for wired battery reports for {tablet.Properties.Name}", LogLevel.Info);
+                    }
+                    else
+                    {
+                        Log.Write("Wireless Kit Addon", $"Failed to handle the Wireless Kit for {tablet.Properties.Name}", LogLevel.Warning);
+                    }
+                }
                 else if (DeviceTree != null)
                 {
                     // Wired or wireless (non-passthrough) mode — standard initialization
@@ -195,25 +211,58 @@ namespace WirelessKitAddon
         {
             // We need to find a wired device (not the wireless dongle) with input length 10 or 11
             var tree = driver.InputDevices.FirstOrDefault(tree => tree.Properties == Tablet!.Properties);
+
+            // Diagnostic: log all devices in the tree so we can see what OTD matched
+            if (tree != null)
+            {
+                foreach (var d in tree.InputDevices)
+                    Log.Write("Wireless Kit Addon",
+                        $"  Tree device: PID={d.Identifier.ProductID}, InputLen={d.Identifier.InputReportLength}, OutputLen={d.Identifier.OutputReportLength}",
+                        LogLevel.Debug);
+            }
+
             var device = tree?.InputDevices.FirstOrDefault(device =>
                 (device.Identifier.InputReportLength == 10 || device.Identifier.InputReportLength == 11) &&
                 device.Identifier.ProductID != WIRELESS_KIT_PID);
 
-            if (device == null)
-                return;
+            if (device != null)
+            {
+                // Found the wired battery endpoint in the tree — verify it exists on the USB bus
+                // Exclude proxy endpoints — they look like wired devices but are wireless dongle proxies
+                var matches = GetMatchingDevices(driver, Tablet!.Properties, device.Identifier)
+                    .Where(d => !d.DevicePath.StartsWith("wireless-proxy://"))
+                    .ToList();
 
-            // Verify the wired device actually exists on the USB bus
-            // Exclude proxy endpoints — they look like wired devices but are wireless dongle proxies
-            var matches = GetMatchingDevices(driver, Tablet!.Properties, device.Identifier)
-                .Where(d => !d.DevicePath.StartsWith("wireless-proxy://"))
-                .ToList();
+                if (matches.Count > 0)
+                {
+                    Log.Write("Wireless Kit Addon", "Using wired mode (USB) — matched from tree.", LogLevel.Info);
+                    HandleMatch(driver, matches);
+                    return;
+                }
+            }
 
-            if (matches.Count == 0)
-                return;
+            // Fallback: search CompositeDeviceHub directly for a wired battery endpoint.
+            // On macOS, HIDSharpCore may report different report lengths than what the
+            // tablet config expects, so the tree may not contain the wired battery device.
+            var fallbackEndpoint = driver.CompositeDeviceHub.GetDevices()
+                .Where(d => d.VendorID == WACOM_VID
+                    && d.ProductID != WIRELESS_KIT_PID
+                    && (d.InputReportLength == 10 || d.InputReportLength == 11)
+                    && d.CanOpen
+                    && !d.DevicePath.StartsWith("wireless-proxy://"))
+                .FirstOrDefault();
 
-            Log.Write("Wireless Kit Addon", "Using wired mode (USB).", LogLevel.Info);
-
-            HandleMatch(driver, matches);
+            if (fallbackEndpoint != null)
+            {
+                Log.Write("Wireless Kit Addon",
+                    $"Using wired mode (USB) — fallback match: PID={fallbackEndpoint.ProductID}, InputLen={fallbackEndpoint.InputReportLength}",
+                    LogLevel.Info);
+                HandleMatch(driver, new[] { fallbackEndpoint });
+            }
+            else
+            {
+                Log.Write("Wireless Kit Addon", "No wired battery endpoint found in tree or on USB bus.", LogLevel.Debug);
+            }
         }
 
         private bool HandleMatch(Driver driver, IEnumerable<IDeviceEndpoint> matches)
@@ -300,6 +349,19 @@ namespace WirelessKitAddon
                     _instance.IsCharging = batteryReport.IsCharging;
 
                     CheckBatteryWarnings(batteryReport.Battery, batteryReport.IsCharging);
+                }
+                else if (report.Raw != null && report.Raw.Length >= 10 && report.Raw[0] == 0xC0)
+                {
+                    // Wired battery report (report ID 0xC0) on the same HID interface as pen data.
+                    // OTD's digitizer parser returns a generic DeviceReport for unknown report IDs,
+                    // but the raw bytes are preserved — parse battery from them directly.
+                    float battery = (report.Raw[8] & 0x3F) * 100 / 31f;
+                    bool charging = (report.Raw[8] & 0x80) != 0;
+
+                    _instance.BatteryLevel = battery;
+                    _instance.IsCharging = charging;
+
+                    CheckBatteryWarnings(battery, charging);
                 }
 
                 if (report is IWirelessKitReport wirelessReport)

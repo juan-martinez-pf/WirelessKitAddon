@@ -29,9 +29,22 @@ sealed class Program
 
     // Avalonia configuration, don't remove; also used by visual designer.
     public static AppBuilder BuildAvaloniaApp()
-        => AppBuilder.Configure<App>()
+    {
+        var builder = AppBuilder.Configure<App>()
             .UsePlatformDetect()
-            .SetupDesktopNotifications(out NotificationManager)
             .WithInterFont()
             .LogToTrace();
+
+        try
+        {
+            builder = builder.SetupDesktopNotifications(out NotificationManager);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Desktop notifications unavailable: {ex.Message}");
+            NotificationManager = null;
+        }
+
+        return builder;
+    }
 }
